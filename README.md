@@ -65,7 +65,12 @@ optional arguments:
   --show_cores         Show per-core CPU gauges
 ```
 
-The fork reads NUL-delimited plist samples directly from `powermetrics` stdout. It does not create or reread a growing capture file. `--max_count` was removed because the streaming producer is managed for the lifetime of the CLI.
+The fork reads NUL-delimited plist samples directly from `powermetrics` stdout.
+It discards superseded complete frames before XML deserialization and reclaims
+the parser's reference cycles after each consumed sample. This also bounds
+transient parser allocations on Python 3.14.0-3.14.4's incremental GC.
+It does not create or reread a growing capture file. `--max_count` was removed
+because the streaming producer is managed for the lifetime of the CLI.
 
 ## Development and verification
 

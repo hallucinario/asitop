@@ -1,7 +1,9 @@
 import sys
+import plistlib
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from asitop.collector import (
     MAX_PENDING_BYTES,
@@ -67,6 +69,13 @@ class PowermetricsCollectorTests(unittest.TestCase):
             sample = collector.next_sample(timeout=1)
 
         self.assertEqual(sample["sequence"], 19)
+
+    def test_superseded_records_are_discarded_before_deserialization(self):
+        with collector_for("batch", 5) as collector:
+            with mock.patch("asitop.collector.plistlib.loads", wraps=plistlib.loads) as loads:
+                sample = collector.next_sample(timeout=1)
+        self.assertEqual(sample["sequence"], 4)
+        self.assertEqual(loads.call_count, 1)
 
     def test_valid_final_record_without_nul_is_accepted_at_eof(self):
         with collector_for("eof") as collector:

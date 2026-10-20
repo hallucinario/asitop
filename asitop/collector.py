@@ -1,4 +1,5 @@
 import os
+import gc
 import plistlib
 import selectors
 import subprocess
@@ -84,7 +85,7 @@ class PowermetricsCollector:
         self.process = None
         self._pending = bytearray()
         self._stderr_tail = bytearray()
-        self._latest_sample = None
+        self._latest_record = None
         self._sample_ready = False
         self._has_sample = False
         self._started_at = None
@@ -181,9 +182,11 @@ class PowermetricsCollector:
                     and return_code != 0
                     and not (self._stdout_eof and self._stderr_eof)
                 ):
-                    sample = self._latest_sample
-                    self._latest_sample = None
+                    record = self._latest_record
+                    self._latest_record = None
                     self._sample_ready = False
+                    sample = self._parse_record(record)
+                    self._has_sample = True
                     return sample
 
             now = self._clock()
@@ -275,16 +278,22 @@ class PowermetricsCollector:
             record = bytes(self._pending)
             self._pending.clear()
             if record.strip():
-                self._parse_record(record)
+                self._store_record(record)
             start = separator + 1
 
     def _finish_stdout(self):
         if self._pending.strip():
             record = bytes(self._pending)
             self._pending.clear()
-            self._parse_record(record)
+            self._store_record(record)
         else:
             self._pending.clear()
+
+    def _store_record(self, record):
+        # Superseded frames never need an XML parser or a decoded object graph.
+        self._latest_record = record
+        self._sample_ready = True
+        self._last_sample_at = self._clock()
 
     def _parse_record(self, record):
         try:
@@ -293,16 +302,18 @@ class PowermetricsCollector:
             raise MalformedSampleError(
                 f"powermetrics emitted a malformed plist sample: {error}"
             ) from error
+        finally:
+            # plistlib's Expat callbacks form a reference cycle. Reclaim it
+            # after each consumed sample instead of relying on delayed cyclic
+            # GC (notably the incremental collector in Python 3.14.0-3.14.4).
+            gc.collect()
 
         if not isinstance(sample, dict) or "timestamp" not in sample:
             raise MalformedSampleError(
                 "powermetrics plist sample must be a dictionary with a timestamp"
             )
 
-        self._latest_sample = sample
-        self._sample_ready = True
-        self._has_sample = True
-        self._last_sample_at = self._clock()
+        return sample
 
     def _consume_stderr(self, chunk):
         self._stderr_tail.extend(chunk)

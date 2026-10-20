@@ -17,8 +17,9 @@ jobs:
       fail-fast: false
       matrix:
         python-version:
-          - "3.12"
-          - "3.14"
+          - "3.12.13"
+          - "3.14.4"
+          - "3.14.7"
     steps:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
