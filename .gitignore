@@ -3,11 +3,16 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Codex runs and local review evidence
+.codex-runs/
+.codex-reviews/
+
 # C extensions
 *.so
 
 # Distribution / packaging
 .Python
+.venv/
 build/
 develop-eggs/
 dist/
