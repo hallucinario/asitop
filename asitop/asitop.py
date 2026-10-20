@@ -1,31 +1,59 @@
-import time
 import argparse
+import signal
+import sys
 from collections import deque
+from importlib.metadata import version
+
 from dashing import VSplit, HSplit, HGauge, HChart, VGauge
-from .utils import *
-
-parser = argparse.ArgumentParser(
-    description='asitop: Performance monitoring CLI tool for Apple Silicon')
-parser.add_argument('--interval', type=int, default=1,
-                    help='Display interval and sampling interval for powermetrics (seconds)')
-parser.add_argument('--color', type=int, default=2,
-                    help='Choose display color (0~8)')
-parser.add_argument('--avg', type=int, default=30,
-                    help='Interval for averaged values (seconds)')
-parser.add_argument('--show_cores', type=bool, default=False,
-                    help='Choose show cores mode')
-parser.add_argument('--max_count', type=int, default=0,
-                    help='Max show count to restart powermetrics')
-args = parser.parse_args()
+from .collector import PowermetricsCollector, PowermetricsError, ProducerExited
+from .utils import (
+    clear_console,
+    get_ram_metrics_dict,
+    get_soc_info,
+    parse_powermetrics_sample,
+)
 
 
-def main():
+class _TerminationRequested(Exception):
+    def __init__(self, signum):
+        self.signum = signum
+
+
+def _request_termination(signum, frame):
+    raise _TerminationRequested(signum)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description='asitop: Performance monitoring CLI tool for Apple Silicon'
+    )
+    parser.add_argument(
+        '--interval',
+        type=int,
+        default=1,
+        help='Display interval and sampling interval for powermetrics (seconds)',
+    )
+    parser.add_argument('--color', type=int, default=2, help='Choose display color (0~8)')
+    parser.add_argument(
+        '--avg', type=int, default=30, help='Interval for averaged values (seconds)'
+    )
+    parser.add_argument(
+        '--show_cores', action='store_true', help='Choose show cores mode'
+    )
+    parser.add_argument(
+        '--version',
+        action='version',
+        version=f"%(prog)s {version('asitop')}",
+    )
+    return parser
+
+
+def run_ui(args, collector):
     print("\nASITOP - Performance monitoring CLI tool for Apple Silicon")
-    print("You can update ASITOP by running `pip install asitop --upgrade`")
-    print("Get help at `https://github.com/tlkh/asitop`")
+    print(f"Fork version: {version('asitop')}")
+    print("Get help at `https://github.com/hallucinario/asitop`")
     print("P.S. You are recommended to run ASITOP with `sudo asitop`\n")
     print("\n[1/3] Loading ASITOP\n")
-    print("\033[?25l")
 
     cpu1_gauge = HGauge(title="E-CPU Usage", val=0, color=args.color)
     cpu2_gauge = HGauge(title="P-CPU Usage", val=0, color=args.color)
@@ -142,46 +170,26 @@ def main():
 
     print("\n[2/3] Starting powermetrics process\n")
 
-    timecode = str(int(time.time()))
-
-    powermetrics_process = run_powermetrics_process(timecode,
-                                                    interval=args.interval * 1000)
-
     print("\n[3/3] Waiting for first reading...\n")
-
-    def get_reading(wait=0.1):
-        ready = parse_powermetrics(timecode=timecode)
-        while not ready:
-            time.sleep(wait)
-            ready = parse_powermetrics(timecode=timecode)
-        return ready
-
-    ready = get_reading()
+    ready = parse_powermetrics_sample(collector.next_sample())
     last_timestamp = ready[-1]
 
     def get_avg(inlist):
         avg = sum(inlist) / len(inlist)
         return avg
 
-    avg_package_power_list = deque([], maxlen=int(args.avg / args.interval))
-    avg_cpu_power_list = deque([], maxlen=int(args.avg / args.interval))
-    avg_gpu_power_list = deque([], maxlen=int(args.avg / args.interval))
+    average_samples = max(1, int(args.avg / args.interval))
+    avg_package_power_list = deque([], maxlen=average_samples)
+    avg_cpu_power_list = deque([], maxlen=average_samples)
+    avg_gpu_power_list = deque([], maxlen=average_samples)
 
     clear_console()
 
-    count=0
     try:
         while True:
-            if args.max_count > 0:
-                if count >= args.max_count:
-                    count = 0
-                    powermetrics_process.terminate()
-                    timecode = str(int(time.time()))
-                    powermetrics_process = run_powermetrics_process(
-                        timecode, interval=args.interval * 1000)
-                count += 1
-            ready = parse_powermetrics(timecode=timecode)
-            if ready:
+            sample = collector.next_sample(timeout=args.interval)
+            if sample is not None:
+                ready = parse_powermetrics_sample(sample)
                 cpu_metrics_dict, gpu_metrics_dict, thermal_pressure, bandwidth_metrics, timestamp = ready
 
                 if timestamp > last_timestamp:
@@ -401,21 +409,50 @@ def main():
 
                     ui.display()
 
-            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        raise
 
+    return 0
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if args.interval <= 0:
+        print("--interval must be positive", file=sys.stderr)
+        return 2
+    if args.avg <= 0:
+        print("--avg must be positive", file=sys.stderr)
+        return 2
+
+    handled_signals = [signal.SIGINT]
+    if hasattr(signal, "SIGTERM"):
+        handled_signals.append(signal.SIGTERM)
+    original_handlers = {
+        signum: signal.getsignal(signum) for signum in handled_signals
+    }
+
+    try:
+        for signum in handled_signals:
+            signal.signal(signum, _request_termination)
+        print("\033[?25l")
+        with PowermetricsCollector(interval_seconds=args.interval) as collector:
+            return run_ui(args, collector)
     except KeyboardInterrupt:
         print("Stopping...")
+        return 0
+    except _TerminationRequested as requested:
+        print(f"Stopping after signal {requested.signum}...")
+        return 128 + requested.signum
+    except ProducerExited:
+        return 0
+    except (PowermetricsError, OSError, KeyError, TypeError, ValueError) as error:
+        print(f"asitop: {error}", file=sys.stderr)
+        return 1
+    finally:
         print("\033[?25h")
-
-    return powermetrics_process
+        for signum, handler in original_handlers.items():
+            signal.signal(signum, handler)
 
 
 if __name__ == "__main__":
-    powermetrics_process = main()
-    try:
-        powermetrics_process.terminate()
-        print("Successfully terminated powermetrics process")
-    except Exception as e:
-        print(e)
-        powermetrics_process.terminate()
-        print("Successfully terminated powermetrics process")
+    raise SystemExit(main())
